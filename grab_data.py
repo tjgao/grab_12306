@@ -2,15 +2,25 @@
 
 import sys, os
 import datetime
+import traceback
 import requests
 import psycopg2
 import json
 from pathlib import Path
+from selenium import webdriver
 
 url_base ='https://kyfw.12306.cn/otn/'
 start_url = url_base + 'leftTicket/init'
 station_url = url_base + 'leftTicket/query'
 price_url = url_base + 'leftTicket/queryTicketPrice'
+
+def load_dictionary(dict_file):
+    dictionary = {}
+    with open(dict_file) as f:
+        for ln in f:
+            s = [x.strip().upper() for x in ln.split(',')]
+            dictionary[s[3]] = s[2] 
+    return dictionary
 
 
 def load_route_tasks(route_tasks_file):
@@ -20,9 +30,10 @@ def load_route_tasks(route_tasks_file):
             route = [x.strip().upper() for x in ln.split(',')]
             key = '-'.join(route[:2])
             if key in tasks: continue
+            print('$ ' + route[2])
             visited = True
             if len(route) < 3: visited = False
-            elif route[2] == 'False': visited = False
+            elif route[2].upper() == 'FALSE': visited = False
             tasks[key] = [route[0], route[1], visited]
     return tasks
 
@@ -36,7 +47,7 @@ def load_price_tasks(price_tasks_file):
             key = '-'.join(seg[:4])
             visited = True
             if len(seg) < 5: visited = False
-            elif route[4] == 'False': visited = False
+            elif route[4].upper() == 'FALSE': visited = False
             tasks[key] = route[:4] + [visited]
     return tasks
 
@@ -58,19 +69,22 @@ def store_tickets(conn, fro, to, tdate, content):
         conn.commit()
         return True
     except:
+        print('insert failed: ', sys.exc_info()[0])
         conn.rollback()
         return False
 
-def grab_tickets(ses, fro, to, tdate):
+def grab_tickets(web, fro, to, tdate, cookie):
     global station_url
     print(station_url)
-    resp = ses.get('{}?leftTicketDTO.from_station={}&leftTicketDTO.to_station={}&leftTicketDTO.train_date={}&purpose_codes=ADULT'.format(station_url, fro, to, tdate)) 
+    web.get('{}?leftTicketDTO.from_station={}&leftTicketDTO.to_station={}&leftTicketDTO.train_date={}&purpose_codes=ADULT'.format(station_url, fro, to, tdate)) 
+    print('-------')
+    print(resp.text)
     try:
         o = json.loads(resp.text)
         if o.get('c_url') and o.get('status') is not None:
             print('url changed')
             station_url = url_base + o.get('c_url')
-            return grab_tickets(ses, fro, to, tdate)
+            return grab_tickets(ses, fro, to, tdate, cookie)
         print(resp.text)
         return resp.text
     except:
@@ -88,8 +102,15 @@ def retrieve_price(text):
     return lst
 
 def store_ticket_price(conn, train_no, fro_no, to_no, seat_types, content):
-    cur = conn.cursor()
-    cur.execute("""insert into ticket_price (train_no, from_station_no, to_station_no, seat_types, content, update_time) values (%s,%s,%s,%s,%s,now())""")
+    try:
+        cur = conn.cursor()
+        cur.execute("""insert into ticket_price (train_no, from_station_no, to_station_no, seat_types, content, update_time) values (%s,%s,%s,%s,%s,now())""")
+        conn.commit()
+        return True
+    except:
+        print('insert failed: ', sys.exc_info()[0])
+        conn.rollback()
+        return False
 
 def contain_price(data):
     for k in data:
@@ -108,21 +129,53 @@ def grab_ticket_price(ses, train_no, fro_no, to_no, seat_types, tdate):
     except:
         return ''
 
+
 if __name__ == '__main__':
+    driver_path = os.path.dirname(os.path.abspath(__file__))
+    driver_path += os.sep + 'chromedriver'
+    driver = webdriver.Chrome(driver_path)
+    driver.get(start_url)
+
+    # test
+    driver.get('https://kyfw.12306.cn/otn/leftTicket/queryZ?leftTicketDTO.train_date=2018-01-31&leftTicketDTO.from_station=BJP&leftTicketDTO.to_station=SHH&purpose_codes=ADULT')
+    
+    j = driver.find_element_by_tag_name('pre').text
+    print(j)
+    sys.exit()
+    request_cookies_browser = driver.get_cookies()
     session = requests.Session()
-    resp = session.get(start_url)
+    faked_cookie = dict()
+    for c in request_cookies_browser:
+        if c.get('JSESSIONID'):
+            faked_cookie['JSESSIONID'] = c['JESSIONID']
+        if c.get('RAIL_EXPIRATION'):
+            faked_cookie['RAIL_EXPIRATION'] = c['RAIL_EXPIRATION']
+        if c.get('RAIL_DEVICEID'):
+            faked_cookie['RAIL_DEVICEID'] = c['RAIL_DEVICEID']
+        if c.get('_jc_save_fromDate'):
+            faked_cookie['_jc_save_fromDate'] = c['_jc_save_fromDate']
+        if c.get('_jc_save_wfdc_flag'):
+            faked_cookie['_jc_save_wfdc_flag'] = c['_jc_save_wfdc_flag']
+        if c.get('route'):
+            faked_cookie['route'] = c['route']
+        if c.get('BIGipServerotn'):
+            faked_cookie['BIGipServerotn'] = c['BIGipServerotn']
+
+#    resp = session.get(start_url)
 
     conn_str = "dbname='ticket_cache' user='dbuser' host='localhost' password='dbuser'"
     conn = psycopg2.connect(conn_str)
 
-    tdate = (datetime.date.today() + datetime.timedelta(days=25)).strftime('%Y-%m-%d')
     route_tasks, price_tasks = load_tasks('route_tasks.csv', 'price_tasks.csv')
+    table = load_dictionary('stations.csv')
     try:
         for key in route_tasks:
             r = route_tasks[key]
             print(r)
             if r[2]: continue
-            text = grab_tickets(session, r[0], r[1], tdate)
+            tdate = (datetime.date.today() + datetime.timedelta(days=25)).strftime('%Y-%m-%d')
+            prepare_cookie(faked_cookie, tdate, r[0], r[1], table)
+            text = grab_tickets(session, r[0], r[1], tdate, faked_cookie)
             if text == '': 
                 print('fail to grab ticket info: {} -> {} on {}'.format(r[0], r[1], tdate))
                 continue
@@ -149,6 +202,7 @@ if __name__ == '__main__':
                 price_tasks[key][5] = True
                 print('Price for #{} {} -> {} on {} DONE'.format(r[0], r[1], r[2], r[3], r[4]))
     except:
-        print('Uncaught excpetion: ', sys.exc_info()[0])
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        traceback.print_exception(exc_type, exc_value, exc_traceback) 
     finally:
         store_tasks_to_disk(route_tasks, 'route_tasks.csv',price_tasks, 'price_tasks.csv')
